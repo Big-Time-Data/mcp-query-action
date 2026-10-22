@@ -1,0 +1,102 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Each Monday: a new mcpq release must still work with this action.
+    - cron: "17 6 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint .github/workflows/*.yml
+      - name: shellcheck
+        run: shellcheck -s sh scripts/install.sh
+
+  publish:
+    # The action against Postgres, with the starter tree of mcpq init and
+    # one table for the catalog source. MCPQ_CONN holds the file content,
+    # as a secret does.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [latest, v0]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: mcpq
+          POSTGRES_PASSWORD: mcpq
+          POSTGRES_DB: shop
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U mcpq -d shop"
+          --health-interval 2s --health-timeout 2s --health-retries 30
+    env:
+      PGHOST: localhost
+      PGUSER: mcpq
+      PGPASSWORD: mcpq
+      PGDATABASE: shop
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mcpq for init
+        env:
+          MCPQ_VERSION: ${{ matrix.version }}
+          MCPQ_INSTALL_DIR: ${{ runner.temp }}/init-bin
+        run: sh scripts/install.sh
+      - name: Make the starter tree and the context schema
+        run: |
+          set -euo pipefail
+          mkdir shop && cd shop && git init -q
+          "$RUNNER_TEMP/init-bin/mcpq" init --yes --no-ci --warehouse postgres --schema mcpq --org "Test Shop"
+          perl -0pi -e 's/  # catalog_scope:\n  #   databases: \[ANALYTICS\]\n  #   include_schemas: \[MARTS\]/  catalog_scope:\n    databases: [shop]\n    include_schemas: [shop]/; s/  # catalog:\n  #   profile: false/  catalog:\n    profile: false/' mcpq/mcpq.yaml
+          grep -q '^  catalog:' mcpq/mcpq.yaml
+          psql -v ON_ERROR_STOP=1 -qc "CREATE SCHEMA shop; CREATE TABLE shop.orders (id int PRIMARY KEY, amount numeric); INSERT INTO shop.orders VALUES (1, 10);"
+          for f in 01-schema.sql 03-log-procedure.sql; do
+            psql -v ON_ERROR_STOP=1 -q -f "mcpq/sql/$f"
+          done
+      - uses: ./
+        with:
+          version: ${{ matrix.version }}
+          working_directory: shop
+          source: curated, catalog
+        env:
+          MCPQ_CONN: |
+            type: postgres
+            host: localhost
+            port: 5432
+            user: mcpq
+            password: mcpq
+            database: shop
+            sslmode: disable
+      - name: Check the published tables
+        run: test "$(psql -tAc 'SELECT count(*) FROM mcpq.tables')" -ge 1
+
+  no-conn:
+    # The action stops before it builds when MCPQ_CONN is not set.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: run
+        uses: ./
+        continue-on-error: true
+      - name: Check that the action failed
+        env:
+          OUTCOME: ${{ steps.run.outcome }}
+        run: test "$OUTCOME" = failure

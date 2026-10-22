@@ -1,0 +1,178 @@
+name: "mcpq publish"
+description: >-
+  Install mcpq and uv, build and publish the context tables with the same
+  steps as a laptop, validate them, and post the diff to the step summary.
+branding:
+  icon: database
+  color: blue
+
+inputs:
+  source:
+    description: "Comma-separated source names; empty builds every enabled source"
+    default: ""
+  config:
+    description: "Path to mcpq.yaml, from working_directory; empty means ./mcpq.yaml, else ./mcpq/mcpq.yaml"
+    default: ""
+  working_directory:
+    description: "Folder to run mcpq in, from the repo root"
+    default: "."
+  version:
+    description: >-
+      mcpq release: latest, vX.Y.Z, or a major such as v0. Empty takes it
+      from the action ref: @vX.Y.Z or @v0 picks that release, a branch or
+      a sha picks the newest.
+    default: ""
+  eval_tags:
+    description: "Eval tags to run after publish; empty skips evals"
+    default: ""
+  github_token:
+    description: "Optional token for the GitHub API call that resolves a major version"
+    default: ""
+  bin:
+    description: "Path to an mcpq binary to use instead of a release, for tests of the action"
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install mcpq and check the checksum
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_BIN: ${{ inputs.bin }}
+        ACTION_REF: ${{ github.action_ref }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        MCPQ_INSTALL_DIR: ${{ runner.temp }}/mcpq-bin
+      run: |
+        set -euo pipefail
+        # No set -x: the job env holds MCPQ_CONN and it must not echo.
+        if [[ -n $INPUT_BIN ]]; then
+          mkdir -p "$MCPQ_INSTALL_DIR"
+          install -m 0755 "$INPUT_BIN" "$MCPQ_INSTALL_DIR/mcpq"
+          echo "$MCPQ_INSTALL_DIR" >> "$GITHUB_PATH"
+          "$MCPQ_INSTALL_DIR/mcpq" version
+          exit 0
+        fi
+        version=$INPUT_VERSION
+        if [[ -z $version ]]; then
+          if [[ $ACTION_REF =~ ^v[0-9]+(\.[0-9]+\.[0-9]+)?$ ]]; then version=$ACTION_REF; else version=latest; fi
+        fi
+        MCPQ_VERSION=$version sh "$GITHUB_ACTION_PATH/scripts/install.sh"
+        echo "$MCPQ_INSTALL_DIR" >> "$GITHUB_PATH"
+        "$MCPQ_INSTALL_DIR/mcpq" version
+
+    - name: Write the connection file
+      id: conn
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The MCPQ_CONN secret holds the conn file content; mcpq reads a path.
+        # The later steps set MCPQ_CONN to this path: the caller's step env
+        # wins over GITHUB_ENV.
+        if [[ -z ${MCPQ_CONN:-} ]]; then
+          echo "::error::set MCPQ_CONN in the step env to the secret that holds the conn file"
+          exit 1
+        fi
+        conn=$MCPQ_CONN
+        if [[ ! -f $conn ]]; then
+          conn="$RUNNER_TEMP/mcpq-conn.yaml"
+          (umask 077 && printf '%s\n' "$MCPQ_CONN" > "$conn")
+        fi
+        echo "path=$conn" >> "$GITHUB_OUTPUT"
+
+    - name: Check if dbt generate needs uv
+      id: uv
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        CONFIG: ${{ inputs.config }}
+        SOURCE: ${{ inputs.source }}
+      run: |
+        set -euo pipefail
+        need=false
+        if [[ -z $SOURCE || ,${SOURCE// /}, == *,dbt,* ]] && grep -Eq '^[[:space:]]+dbt_core:' "$CONFIG"; then
+          need=true
+        fi
+        echo "need=$need" >> "$GITHUB_OUTPUT"
+
+    - name: Install uv
+      if: steps.uv.outputs.need == 'true'
+      uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      with:
+        version: "0.13.1" # tools.UVVersion
+        enable-cache: true
+        cache-dependency-glob: ""
+        ignore-nothing-to-cache: true
+
+    - name: Build
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        CONFIG: ${{ inputs.config }}
+        MCPQ_CONN: ${{ steps.conn.outputs.path }}
+        SOURCE: ${{ inputs.source }}
+      run: |
+        set -euo pipefail
+        source_args=()
+        IFS=, read -ra names <<< "$SOURCE"
+        for name in "${names[@]}"; do
+          name=${name// /}
+          if [[ -n $name ]]; then source_args+=(--source "$name"); fi
+        done
+        # --yes lets mcpq download uv when setup-uv did not run.
+        artifact=$(mcpq ${CONFIG:+--config "$CONFIG"} build --yes "${source_args[@]}" | sed -n 's/^artifact //p')
+        if [[ -z $artifact ]]; then
+          echo "build printed no artifact path" >&2
+          exit 1
+        fi
+        echo "ARTIFACT=$artifact" >> "$GITHUB_ENV"
+
+    - name: Post the diff to the step summary
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        CONFIG: ${{ inputs.config }}
+        MCPQ_CONN: ${{ steps.conn.outputs.path }}
+      run: |
+        set -euo pipefail
+        # The diff runs before publish, so it shows what this build changes.
+        {
+          echo "## mcpq diff"
+          echo
+          mcpq ${CONFIG:+--config "$CONFIG"} diff "$ARTIFACT" current --format md
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Publish
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        CONFIG: ${{ inputs.config }}
+        MCPQ_CONN: ${{ steps.conn.outputs.path }}
+      run: mcpq ${CONFIG:+--config "$CONFIG"} publish --artifact "$ARTIFACT"
+
+    - name: Validate
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        CONFIG: ${{ inputs.config }}
+        MCPQ_CONN: ${{ steps.conn.outputs.path }}
+      run: mcpq ${CONFIG:+--config "$CONFIG"} validate --stage published
+
+    - name: Run evals
+      if: ${{ inputs.eval_tags != '' }}
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        CONFIG: ${{ inputs.config }}
+        MCPQ_CONN: ${{ steps.conn.outputs.path }}
+        EVAL_TAGS: ${{ inputs.eval_tags }}
+      run: |
+        set -euo pipefail
+        if [[ -z ${MCPQ_EVAL:-} ]]; then
+          echo "MCPQ_EVAL is not set; skip evals."
+          exit 0
+        fi
+        # The secret holds the harness login; the claude harness reads it
+        # from the environment.
+        export ANTHROPIC_API_KEY="$MCPQ_EVAL"
+        mcpq ${CONFIG:+--config "$CONFIG"} eval run --tags "$EVAL_TAGS"
