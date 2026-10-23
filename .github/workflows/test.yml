@@ -65,7 +65,7 @@ jobs:
           set -euo pipefail
           mkdir shop && cd shop && git init -q
           "$RUNNER_TEMP/init-bin/mcpq" init --yes --no-ci --warehouse postgres --schema mcpq --org "Test Shop"
-          perl -0pi -e 's/  # catalog_scope:\n  #   databases: \[ANALYTICS\]\n  #   include_schemas: \[MARTS\]/  catalog_scope:\n    databases: [shop]\n    include_schemas: [shop]/; s/  # catalog:\n  #   profile: false/  catalog:\n    profile: false/' mcpq/mcpq.yaml
+          perl -0pi -e 's/  # catalog:\n  #   profile: false/  catalog:\n    profile: false/' mcpq/mcpq.yaml
           grep -q '^  catalog:' mcpq/mcpq.yaml
           psql -v ON_ERROR_STOP=1 -qc "CREATE SCHEMA shop; CREATE TABLE shop.orders (id int PRIMARY KEY, amount numeric); INSERT INTO shop.orders VALUES (1, 10);"
           for f in 01-schema.sql 03-log-procedure.sql; do
