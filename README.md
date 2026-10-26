@@ -1,5 +1,17 @@
 # mcp-query-action
 
+> [!WARNING]
+> **Deprecated.** This action moved to [`Big-Time-Data/actions/mcp-query`](https://github.com/Big-Time-Data/actions#mcp-query). This repo is archived and gets no more changes. Jobs that use it keep working.
+>
+> To move, run `mcpq ci add --force`, or change the `uses` line:
+>
+> ```yaml
+> - uses: Big-Time-Data/actions/mcp-query@v1
+>   with:
+>     version: v0   # the mcpq release: latest, vX.Y.Z, or a major such as v0
+>     source: dbt,curated,catalog
+> ```
+
 A GitHub Action that builds the MCPQ context and publishes it to your warehouse. It runs the same steps as `mcpq build --publish` on a laptop:
 
 1. Install the `mcpq` release that the tag names, and check its checksum.
